@@ -1,0 +1,183 @@
+name: Wazuh SOC CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  WAZUH_VERSION: 4.7.0
+
+jobs:
+  build-and-scan:
+    runs-on: [self-hosted, linux, x64]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build custom manager image if you have a Dockerfile; otherwise pull official
+      - name: Build or pull Wazuh Manager image
+        id: build
+        run: |
+          set -e
+          if [ -f "docker/wazuh-manager/Dockerfile" ]; then
+            docker build -t wazuh-manager:${{ github.sha }} docker/wazuh-manager/
+          else
+            docker pull wazuh/wazuh-manager:${WAZUH_VERSION}
+            docker tag wazuh/wazuh-manager:${WAZUH_VERSION} wazuh-manager:${{ github.sha }}
+          fi
+
+      - name: Show Trivy version
+        run: trivy -v || true
+
+      - name: Free disk space for scan
+        run: |
+          docker system prune -af || true
+          mkdir -p "$HOME/.cache/trivy" "$HOME/.cache/trivy/tmp"
+          df -h
+
+      # Warm the DB using a recent Trivy container (reliable)
+      - name: Warm Trivy DB cache (via container)
+        run: |
+          set -e
+          CACHE_DIR="$HOME/.cache/trivy"
+          DB_REPO="ghcr.io/aquasecurity/trivy-db:2"
+          TIMEOUT="30m"
+          for i in 1 2 3; do
+            docker run --rm \
+              -v "$CACHE_DIR:/root/.cache/trivy" \
+              ghcr.io/aquasecurity/trivy:0.65.0 \
+              --download-db-only \
+              --db-repository "$DB_REPO" \
+              --timeout "$TIMEOUT" && break || sleep 20
+          done
+
+      # Fail on HIGH/CRITICAL; reuse warmed DB; use vuln-only for speed
+      - name: Run Trivy vulnerability scanner
+        run: |
+          set -e
+          CACHE_DIR="$HOME/.cache/trivy"
+          DB_REPO="ghcr.io/aquasecurity/trivy-db:2"
+          TIMEOUT="30m"
+          export TMPDIR="$CACHE_DIR/tmp"
+          mkdir -p "$TMPDIR"
+          trivy image \
+            --scanners vuln \
+            --cache-dir "$CACHE_DIR" \
+            --skip-db-update \
+            --db-repository "$DB_REPO" \
+            --timeout "$TIMEOUT" \
+            --severity CRITICAL,HIGH \
+            --exit-code 1 \
+            --format json \
+            --output trivy-report.json \
+            wazuh-manager:${{ github.sha }}
+
+      - name: Fetch Trivy HTML template
+        if: always()
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl -o html.tpl
+
+      - name: Generate Trivy HTML Report
+        if: always()
+        continue-on-error: true
+        run: |
+          CACHE_DIR="$HOME/.cache/trivy"
+          DB_REPO="ghcr.io/aquasecurity/trivy-db:2"
+          TIMEOUT="30m"
+          export TMPDIR="$CACHE_DIR/tmp"
+          trivy image \
+            --scanners vuln \
+            --cache-dir "$CACHE_DIR" \
+            --skip-db-update \
+            --db-repository "$DB_REPO" \
+            --timeout "$TIMEOUT" \
+            --severity CRITICAL,HIGH \
+            --format template \
+            --template "@html.tpl" \
+            --output trivy-report.html \
+            wazuh-manager:${{ github.sha }}
+
+      - name: Upload Trivy Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: trivy-report.html
+
+  test:
+    runs-on: [self-hosted, linux, x64]
+    needs: build-and-scan
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy temporary test stack
+        run: |
+          docker stack deploy -c stack/wazuh-stack.yml wazuh-test
+          # wait for services (simple approach)
+          timeout 300 bash -c 'until docker service ls | grep -E "1/1|2/2"; do sleep 10; done'
+
+      - name: Create Python venv & install test deps
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          pip install selenium pytest pytest-html webdriver-manager
+
+      - name: Run Selenium tests
+        run: |
+          source .venv/bin/activate
+          pytest tests/selenium/test_dashboard.py -v --html=selenium-report.html
+
+      - name: Upload Selenium report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selenium-report
+          path: selenium-report.html
+
+      - name: Cleanup test stack
+        if: always()
+        run: docker stack rm wazuh-test
+
+  deploy:
+    runs-on: [self-hosted, linux, x64]
+    needs: [build-and-scan, test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure Ansible vault password
+        run: |
+          echo "${{ secrets.ANSIBLE_VAULT_PASSWORD }}" > .vault_pass
+          chmod 600 .vault_pass
+
+      - name: Ensure Docker Swarm initialized
+        run: docker swarm init || true
+
+      - name: Deploy via Ansible
+        run: |
+          ansible-playbook \
+            -i ansible/inventory/production.yml \
+            --vault-password-file .vault_pass \
+            -e "image_tag=${{ github.sha }}" \
+            ansible/playbooks/deploy.yml
+
+      - name: Verify deployment
+        run: |
+          docker stack services wazuh-soc
+          python3 tests/api/health_check.py
+
+      - name: Cleanup sensitive files
+        if: always()
+        run: rm -f .vault_pass

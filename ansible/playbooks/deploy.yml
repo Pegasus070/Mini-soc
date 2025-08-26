@@ -1,0 +1,10 @@
+---
+- hosts: localhost
+  become: yes
+  tasks:
+    - name: Ensure Docker Swarm exists
+      command: docker swarm init
+      ignore_errors: yes
+
+    - name: Deploy/Update Wazuh stack
+      command: docker stack deploy -c stack/wazuh-stack.yml wazuh-soc
