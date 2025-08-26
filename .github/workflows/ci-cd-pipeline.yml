@@ -11,6 +11,9 @@ env:
   WAZUH_VERSION: 4.7.0
 
 jobs:
+  # ──────────────────────────────
+  # 1) Build and Trivy scan
+  # ──────────────────────────────
   build-and-scan:
     runs-on: [self-hosted, linux, x64]
 
@@ -21,7 +24,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Build custom manager image if you have a Dockerfile; otherwise pull official
+      # Build custom image if you have a Dockerfile; otherwise pull the official one
       - name: Build or pull Wazuh Manager image
         id: build
         run: |
@@ -33,32 +36,13 @@ jobs:
             docker tag wazuh/wazuh-manager:${WAZUH_VERSION} wazuh-manager:${{ github.sha }}
           fi
 
-      - name: Show Trivy version
-        run: trivy -v || true
-
-      - name: Free disk space for scan
+      - name: Prep disk space for Trivy
         run: |
           docker system prune -af || true
           mkdir -p "$HOME/.cache/trivy" "$HOME/.cache/trivy/tmp"
           df -h
 
-      # Warm the DB using a recent Trivy container (reliable)
-      - name: Warm Trivy DB cache (via container)
-        run: |
-          set -e
-          CACHE_DIR="$HOME/.cache/trivy"
-          DB_REPO="ghcr.io/aquasecurity/trivy-db:2"
-          TIMEOUT="30m"
-          for i in 1 2 3; do
-            docker run --rm \
-              -v "$CACHE_DIR:/root/.cache/trivy" \
-              ghcr.io/aquasecurity/trivy:0.65.0 \
-              --download-db-only \
-              --db-repository "$DB_REPO" \
-              --timeout "$TIMEOUT" && break || sleep 20
-          done
-
-      # Fail on HIGH/CRITICAL; reuse warmed DB; use vuln-only for speed
+      # First run downloads DB (no --skip-db-update); we use GHCR mirror, long timeout, and retries
       - name: Run Trivy vulnerability scanner
         run: |
           set -e
@@ -67,22 +51,23 @@ jobs:
           TIMEOUT="30m"
           export TMPDIR="$CACHE_DIR/tmp"
           mkdir -p "$TMPDIR"
-          trivy image \
-            --scanners vuln \
-            --cache-dir "$CACHE_DIR" \
-            --skip-db-update \
-            --db-repository "$DB_REPO" \
-            --timeout "$TIMEOUT" \
-            --severity CRITICAL,HIGH \
-            --exit-code 1 \
-            --format json \
-            --output trivy-report.json \
-            wazuh-manager:${{ github.sha }}
+
+          for i in 1 2 3; do
+            trivy image \
+              --scanners vuln \
+              --cache-dir "$CACHE_DIR" \
+              --db-repository "$DB_REPO" \
+              --timeout "$TIMEOUT" \
+              --severity CRITICAL,HIGH \
+              --exit-code 1 \
+              --format json \
+              --output trivy-report.json \
+              wazuh-manager:${{ github.sha }} && break || sleep 20
+          done
 
       - name: Fetch Trivy HTML template
         if: always()
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl -o html.tpl
+        run: curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl -o html.tpl
 
       - name: Generate Trivy HTML Report
         if: always()
@@ -92,10 +77,10 @@ jobs:
           DB_REPO="ghcr.io/aquasecurity/trivy-db:2"
           TIMEOUT="30m"
           export TMPDIR="$CACHE_DIR/tmp"
+
           trivy image \
             --scanners vuln \
             --cache-dir "$CACHE_DIR" \
-            --skip-db-update \
             --db-repository "$DB_REPO" \
             --timeout "$TIMEOUT" \
             --severity CRITICAL,HIGH \
@@ -111,6 +96,9 @@ jobs:
           name: trivy-report
           path: trivy-report.html
 
+  # ──────────────────────────────
+  # 2) Spin test stack + run Selenium
+  # ──────────────────────────────
   test:
     runs-on: [self-hosted, linux, x64]
     needs: build-and-scan
@@ -122,7 +110,7 @@ jobs:
       - name: Deploy temporary test stack
         run: |
           docker stack deploy -c stack/wazuh-stack.yml wazuh-test
-          # wait for services (simple approach)
+          # naive readiness wait (ok for demo)
           timeout 300 bash -c 'until docker service ls | grep -E "1/1|2/2"; do sleep 10; done'
 
       - name: Create Python venv & install test deps
@@ -148,6 +136,9 @@ jobs:
         if: always()
         run: docker stack rm wazuh-test
 
+  # ──────────────────────────────
+  # 3) Deploy to Swarm with Ansible (main branch pushes only)
+  # ──────────────────────────────
   deploy:
     runs-on: [self-hosted, linux, x64]
     needs: [build-and-scan, test]
@@ -157,6 +148,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Ensure you've created repo secret ANSIBLE_VAULT_PASSWORD
       - name: Configure Ansible vault password
         run: |
           echo "${{ secrets.ANSIBLE_VAULT_PASSWORD }}" > .vault_pass
@@ -165,6 +157,7 @@ jobs:
       - name: Ensure Docker Swarm initialized
         run: docker swarm init || true
 
+      # Ansible must already be installed on the self-hosted runner
       - name: Deploy via Ansible
         run: |
           ansible-playbook \
