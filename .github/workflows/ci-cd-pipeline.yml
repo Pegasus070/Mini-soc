@@ -42,50 +42,34 @@ jobs:
           mkdir -p "$HOME/.cache/trivy" "$HOME/.cache/trivy/tmp"
           df -h
 
-      # First run downloads DB (no --skip-db-update); we use GHCR mirror, long timeout, and retries
-      - name: Run Trivy vulnerability scanner
-        run: |
-          set -e
-          CACHE_DIR="$HOME/.cache/trivy"
-          DB_REPO="ghcr.io/aquasecurity/trivy-db:2"
-          TIMEOUT="30m"
-          export TMPDIR="$CACHE_DIR/tmp"
-          mkdir -p "$TMPDIR"
-
-          for i in 1 2 3; do
-            trivy image \
-              --scanners vuln \
-              --cache-dir "$CACHE_DIR" \
-              --db-repository "$DB_REPO" \
-              --timeout "$TIMEOUT" \
-              --severity CRITICAL,HIGH \
-              --exit-code 1 \
-              --format json \
-              --output trivy-report.json \
-              wazuh-manager:${{ github.sha }} && break || sleep 20
-          done
-
       - name: Fetch Trivy HTML template
-        if: always()
         run: curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl -o html.tpl
 
-      - name: Generate Trivy HTML Report
-        if: always()
-        continue-on-error: true
+      # Trivy uses Docker socket explicitly, fails on HIGH/CRITICAL, but still produces HTML
+      - name: Run Trivy vulnerability scanner (Docker engine → HTML)
         run: |
+          set -euo pipefail
           CACHE_DIR="$HOME/.cache/trivy"
           DB_REPO="ghcr.io/aquasecurity/trivy-db:2"
-          TIMEOUT="30m"
-          export TMPDIR="$CACHE_DIR/tmp"
+          TIMEOUT="20m"
+          mkdir -p "$CACHE_DIR"
+
+          # Ensure the local image exists (pull-and-retag fallback)
+          if ! docker image inspect wazuh-manager:${{ github.sha }} >/dev/null 2>&1; then
+            echo "Local tag not found; pulling official image and retagging…"
+            docker pull wazuh/wazuh-manager:${WAZUH_VERSION}
+            docker tag  wazuh/wazuh-manager:${WAZUH_VERSION}  wazuh-manager:${{ github.sha }}
+          fi
 
           trivy image \
+            --docker-host "unix:///var/run/docker.sock" \
             --scanners vuln \
             --cache-dir "$CACHE_DIR" \
             --db-repository "$DB_REPO" \
             --timeout "$TIMEOUT" \
             --severity CRITICAL,HIGH \
-            --format template \
-            --template "@html.tpl" \
+            --exit-code 1 \
+            --format template --template "@html.tpl" \
             --output trivy-report.html \
             wazuh-manager:${{ github.sha }}
 
@@ -97,8 +81,8 @@ jobs:
           path: trivy-report.html
 
   # ──────────────────────────────
-# 2) Spin test stack + run Selenium
-# ──────────────────────────────
+  # 2) Spin test stack + run Selenium
+  # ──────────────────────────────
   test:
     runs-on: [self-hosted, linux, x64]
     needs: build-and-scan
@@ -116,31 +100,38 @@ jobs:
 
       - name: Deploy temporary test stack
         run: |
+          set -euo pipefail
           STACK=wazuh-test
-          docker stack deploy -c stack/wazuh-stack.yml $STACK
-          echo "Waiting for services to start…"
-          # wait for services to have desired replicas
+          docker stack deploy -c stack/wazuh-stack.yml "$STACK"
+          echo "Waiting for services to report desired replicas…"
           for i in {1..60}; do
-            READY=$(docker stack services $STACK --format '{{.Replicas}}' | awk -F/ '$1==$2' | wc -l)
-            TOTAL=$(docker stack services $STACK --format '{{.Replicas}}' | wc -l)
+            READY=$(docker stack services "$STACK" --format '{{.Replicas}}' | awk -F/ '$1==$2' | wc -l)
+            TOTAL=$(docker stack services "$STACK" --format '{{.Replicas}}' | wc -l)
             echo "Services ready: $READY/$TOTAL"
             [ "$READY" = "$TOTAL" ] && break || sleep 5
           done
 
-      # Only proceed once the dashboard is really up on 443
+      # Verbose readiness with logs (up to ~20 minutes)
       - name: Wait for Wazuh dashboard on https://localhost:443
         run: |
-          for i in {1..60}; do
-            if curl -skf https://localhost:443 >/dev/null; then
-              echo "✅ Dashboard is up"
+          set -euo pipefail
+          STACK=wazuh-test
+          echo "Waiting for HTTPS 443 to respond (up to ~20 minutes)…"
+          for i in {1..240}; do
+            if curl -skfI https://localhost:443 >/dev/null; then
+              echo "✅ Dashboard reachable on 443"
               exit 0
             fi
-            echo "Still waiting... ($i/60)"
-            docker stack services wazuh-test || true
+            echo "Still waiting ($i/240)…"
+            echo "---- service list ----"
+            docker stack services "$STACK" || true
+            echo "---- dashboard logs (last 100) ----"
+            docker service logs "$STACK"_wazuh-dashboard --tail 100 || true
+            echo "----------------------"
             sleep 5
           done
           echo "❌ Dashboard did not become ready in time"
-          docker service ps wazuh-test_wazuh-dashboard || true
+          docker service ps "$STACK"_wazuh-dashboard || true
           exit 1
 
       # System deps for Selenium (Chromium + chromedriver)
@@ -172,14 +163,14 @@ jobs:
       - name: Cleanup test stack
         if: always()
         run: |
-          docker stack rm wazuh-test
+          STACK=wazuh-test
+          docker stack rm "$STACK" || true
           # give it a moment to go away; ignore errors
           for i in {1..30}; do
-            docker stack ps wazuh-test >/dev/null 2>&1 || break
+            docker stack ps "$STACK" >/dev/null 2>&1 || break
             sleep 2
           done
           docker system prune -af --volumes || true
-
 
   # ──────────────────────────────
   # 3) Deploy to Swarm with Ansible (main branch pushes only)
