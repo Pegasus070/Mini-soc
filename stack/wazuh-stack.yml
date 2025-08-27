@@ -1,46 +1,32 @@
 version: "3.8"
 
-services:
-  wazuh-indexer:
-    image: wazuh/wazuh-indexer:4.7.0
-    deploy:
-      replicas: 1
-    environment:
-      - discovery.type=single-node
-    networks:
-      wazuh-net:
-        aliases:
-          - wazuh.indexer        # make dotted name resolvable in Swarm
-
-  wazuh-manager:
-    image: wazuh/wazuh-manager:4.7.0
-    deploy:
-      replicas: 1
-    ports:
-      - "1514:1514"
-      - "55000:55000"
-    networks:
-      wazuh-net:
-        aliases:
-          - wazuh.manager        # optional, for consistency
-
-  wazuh-dashboard:
-    image: wazuh/wazuh-dashboard:4.7.0
-    deploy:
-      replicas: 1
-    ports:
-      - "443:5601"
-    # Prefer the dashed service name to avoid relying on aliases:
-    environment:
-      - OPENSEARCH_HOSTS=["https://wazuh-indexer:9200"]
-      # If your dashboard image expects the dotted name, the alias above still makes it work.
-      # You can keep only one of these (OPENSEARCH_HOSTS or the image default).
-    depends_on:
-      - wazuh-indexer
-    networks:
-      wazuh-net:
-
 networks:
   wazuh-net:
     driver: overlay
     attachable: true
+
+services:
+  wazuh-indexer:
+    image: wazuh/wazuh-indexer:4.7.0
+    networks:
+      wazuh-net:
+        aliases:
+          - wazuh.indexer          # <-- CRITICAL: gives DNS name dashboard expects
+    deploy:
+      replicas: 1
+
+  wazuh-manager:
+    image: wazuh/wazuh-manager:4.7.0
+    networks:
+      - wazuh-net
+    deploy:
+      replicas: 1
+
+  wazuh-dashboard:
+    image: wazuh/wazuh-dashboard:4.7.0
+    ports:
+      - "443:5601"
+    networks:
+      - wazuh-net
+    deploy:
+      replicas: 1
