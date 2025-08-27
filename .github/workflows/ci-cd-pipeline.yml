@@ -97,8 +97,8 @@ jobs:
           path: trivy-report.html
 
   # ──────────────────────────────
-  # 2) Spin test stack + run Selenium
-  # ──────────────────────────────
+# 2) Spin test stack + run Selenium
+# ──────────────────────────────
   test:
     runs-on: [self-hosted, linux, x64]
     needs: build-and-scan
@@ -107,11 +107,48 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Ensure this runner can use Docker and Swarm is ready
+      - name: Ensure Docker is usable & init Swarm
+        run: |
+          docker version
+          docker info
+          docker swarm init || true
+
       - name: Deploy temporary test stack
         run: |
-          docker stack deploy -c stack/wazuh-stack.yml wazuh-test
-          # naive readiness wait (ok for demo)
-          timeout 300 bash -c 'until docker service ls | grep -E "1/1|2/2"; do sleep 10; done'
+          STACK=wazuh-test
+          docker stack deploy -c stack/wazuh-stack.yml $STACK
+          echo "Waiting for services to start…"
+          # wait for services to have desired replicas
+          for i in {1..60}; do
+            READY=$(docker stack services $STACK --format '{{.Replicas}}' | awk -F/ '$1==$2' | wc -l)
+            TOTAL=$(docker stack services $STACK --format '{{.Replicas}}' | wc -l)
+            echo "Services ready: $READY/$TOTAL"
+            [ "$READY" = "$TOTAL" ] && break || sleep 5
+          done
+
+      # Only proceed once the dashboard is really up on 443
+      - name: Wait for Wazuh dashboard on https://localhost:443
+        run: |
+          for i in {1..60}; do
+            if curl -skf https://localhost:443 >/dev/null; then
+              echo "✅ Dashboard is up"
+              exit 0
+            fi
+            echo "Still waiting... ($i/60)"
+            docker stack services wazuh-test || true
+            sleep 5
+          done
+          echo "❌ Dashboard did not become ready in time"
+          docker service ps wazuh-test_wazuh-dashboard || true
+          exit 1
+
+      # System deps for Selenium (Chromium + chromedriver)
+      - name: Install Chromium & chromedriver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser chromium-chromedriver || true
+          which chromedriver || true
 
       - name: Create Python venv & install test deps
         run: |
@@ -134,7 +171,15 @@ jobs:
 
       - name: Cleanup test stack
         if: always()
-        run: docker stack rm wazuh-test
+        run: |
+          docker stack rm wazuh-test
+          # give it a moment to go away; ignore errors
+          for i in {1..30}; do
+            docker stack ps wazuh-test >/dev/null 2>&1 || break
+            sleep 2
+          done
+          docker system prune -af --volumes || true
+
 
   # ──────────────────────────────
   # 3) Deploy to Swarm with Ansible (main branch pushes only)
