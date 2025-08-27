@@ -11,7 +11,12 @@ services:
     networks:
       wazuh-net:
         aliases:
-          - wazuh.indexer          # <-- CRITICAL: gives DNS name dashboard expects
+          - wazuh.indexer        # <= required for DNS
+    healthcheck:                  # helps the dashboard wait for indexer
+      test: ["CMD-SHELL", "curl -sk https://localhost:9200 >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
     deploy:
       replicas: 1
 
@@ -28,5 +33,18 @@ services:
       - "443:5601"
     networks:
       - wazuh-net
+    environment:
+      # talk to the indexer alias and ignore TLS cert validation (demo-only)
+      OPENSEARCH_HOSTS: '["https://wazuh.indexer:9200"]'
+      OPENSEARCH_USERNAME: admin
+      OPENSEARCH_PASSWORD: admin
+      OPENSEARCH_SSL_VERIFICATIONMODE: "none"
+      # Optional but common with OS Dashboards:
+      OPENSEARCH_REQUESTHEADERSWHITELIST: '["securitytenant","Authorization"]'
     deploy:
       replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 5
+        window: 2m
