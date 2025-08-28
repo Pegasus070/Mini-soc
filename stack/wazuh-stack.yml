@@ -3,6 +3,7 @@ version: "3.8"
 networks:
   soc:
     driver: overlay
+    attachable: true   # allow docker run to join this overlay during CI health checks
 
 volumes:
   wazuh-indexer-data:
@@ -82,7 +83,6 @@ services:
   wazuh-manager:
     image: "wazuh/wazuh-manager:${WAZUH_VERSION:-4.7.0}"
     environment:
-      # Manager → Indexer (use overlay DNS alias)
       - OPENSEARCH_URL=https://wazuh.indexer:9200
     volumes:
       - wazuh-manager-data:/var/ossec/data
@@ -99,7 +99,6 @@ services:
   wazuh-dashboard:
     image: "wazuh/wazuh-dashboard:${WAZUH_VERSION:-4.7.0}"
     environment:
-      # Dashboard → Indexer & Manager
       - OPENSEARCH_URL=https://wazuh.indexer:9200
       - WAZUH_API_URL=https://wazuh.manager:55000
     networks:
