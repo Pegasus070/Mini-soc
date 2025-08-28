@@ -91,6 +91,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Kernel limits needed by OpenSearch
+      - name: Ensure kernel limits for OpenSearch (vm.max_map_count, file-max)
+        run: |
+          sudo sysctl -w vm.max_map_count=262144
+          sudo sysctl -w fs.file-max=65536
+
       # Ensure this runner can use Docker and Swarm is ready
       - name: Ensure Docker is usable & init Swarm
         run: |
@@ -111,7 +117,7 @@ jobs:
             [ "$READY" = "$TOTAL" ] && break || sleep 5
           done
 
-      # Verbose readiness with logs (up to ~20 minutes)
+      # Wait for the indexer specifically so dashboard can connect
       - name: Wait for indexer (1/1)
         run: |
           set -e
@@ -122,10 +128,14 @@ jobs:
             docker service ps ${STACK}_wazuh-indexer --no-trunc || true
             sleep 5
           done
-          echo "Indexer did not become ready in time"; exit 1
+          echo "Indexer did not become ready in time"
+          docker service ps ${STACK}_wazuh-indexer --no-trunc || true
+          exit 1
 
+      # Now wait for the dashboard to accept HTTPS on 443 (matches your test)
       - name: Wait for Wazuh dashboard on https://localhost:443
         run: |
+          set -e
           for i in {1..120}; do
             if curl -skf https://localhost:443 >/dev/null; then
               echo "✅ Dashboard is up"; exit 0
@@ -135,9 +145,11 @@ jobs:
             sleep 5
           done
           echo "❌ Dashboard did not become ready in time"
-          docker service ps wazuh-test_wazuh-dashboard || true
+          docker service ps wazuh-test_wazuh-dashboard --no-trunc || true
+          # Grab dashboard container logs for quick triage
+          cid=$(docker ps --filter "name=wazuh-test_wazuh-dashboard.1" --format '{{.ID}}' | head -1)
+          [ -n "$cid" ] && docker logs --tail 200 "$cid" || true
           exit 1
-
 
       # System deps for Selenium (Chromium + chromedriver)
       - name: Install Chromium & chromedriver
@@ -170,7 +182,6 @@ jobs:
         run: |
           STACK=wazuh-test
           docker stack rm "$STACK" || true
-          # give it a moment to go away; ignore errors
           for i in {1..30}; do
             docker stack ps "$STACK" >/dev/null 2>&1 || break
             sleep 2
@@ -189,7 +200,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Ensure you've created repo secret ANSIBLE_VAULT_PASSWORD
       - name: Configure Ansible vault password
         run: |
           echo "${{ secrets.ANSIBLE_VAULT_PASSWORD }}" > .vault_pass
@@ -198,7 +208,6 @@ jobs:
       - name: Ensure Docker Swarm initialized
         run: docker swarm init || true
 
-      # Ansible must already be installed on the self-hosted runner
       - name: Deploy via Ansible
         run: |
           ansible-playbook \
