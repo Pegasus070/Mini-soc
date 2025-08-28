@@ -112,27 +112,32 @@ jobs:
           done
 
       # Verbose readiness with logs (up to ~20 minutes)
+      - name: Wait for indexer (1/1)
+        run: |
+          set -e
+          STACK=wazuh-test
+          for i in {1..120}; do
+            READY=$(docker stack services $STACK --format '{{.Name}} {{.Replicas}}' | awk '/wazuh-indexer/ {print $2}')
+            if [ "$READY" = "1/1" ]; then echo "Indexer ready"; exit 0; fi
+            docker service ps ${STACK}_wazuh-indexer --no-trunc || true
+            sleep 5
+          done
+          echo "Indexer did not become ready in time"; exit 1
+
       - name: Wait for Wazuh dashboard on https://localhost:443
         run: |
-          set -euo pipefail
-          STACK=wazuh-test
-          echo "Waiting for HTTPS 443 to respond (up to ~20 minutes)…"
-          for i in {1..240}; do
-            if curl -skfI https://localhost:443 >/dev/null; then
-              echo "✅ Dashboard reachable on 443"
-              exit 0
+          for i in {1..120}; do
+            if curl -skf https://localhost:443 >/dev/null; then
+              echo "✅ Dashboard is up"; exit 0
             fi
-            echo "Still waiting ($i/240)…"
-            echo "---- service list ----"
-            docker stack services "$STACK" || true
-            echo "---- dashboard logs (last 100) ----"
-            docker service logs "$STACK"_wazuh-dashboard --tail 100 || true
-            echo "----------------------"
+            echo "Still waiting… ($i/120)"
+            docker stack services wazuh-test || true
             sleep 5
           done
           echo "❌ Dashboard did not become ready in time"
-          docker service ps "$STACK"_wazuh-dashboard || true
+          docker service ps wazuh-test_wazuh-dashboard || true
           exit 1
+
 
       # System deps for Selenium (Chromium + chromedriver)
       - name: Install Chromium & chromedriver
