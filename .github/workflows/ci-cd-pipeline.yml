@@ -11,8 +11,12 @@ env:
   WAZUH_VERSION: 4.7.0
 
 jobs:
+  # ──────────────────────────────
+  # 1) Build and Trivy scan
+  # ──────────────────────────────
   build-and-scan:
     runs-on: [self-hosted, linux, x64]
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -20,6 +24,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Build custom image if you have a Dockerfile; otherwise pull the official one
       - name: Build or pull Wazuh Manager image
         id: build
         run: |
@@ -40,6 +45,7 @@ jobs:
       - name: Fetch Trivy HTML template
         run: curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl -o html.tpl
 
+      # Trivy uses Docker socket explicitly, fails on HIGH/CRITICAL, but still produces HTML
       - name: Run Trivy vulnerability scanner (Docker engine → HTML)
         run: |
           set -euo pipefail
@@ -48,7 +54,9 @@ jobs:
           TIMEOUT="20m"
           mkdir -p "$CACHE_DIR"
 
+          # Ensure the local image exists (pull-and-retag fallback)
           if ! docker image inspect wazuh-manager:${{ github.sha }} >/dev/null 2>&1; then
+            echo "Local tag not found; pulling official image and retagging…"
             docker pull wazuh/wazuh-manager:${WAZUH_VERSION}
             docker tag  wazuh/wazuh-manager:${WAZUH_VERSION}  wazuh-manager:${{ github.sha }}
           fi
@@ -72,19 +80,24 @@ jobs:
           name: trivy-report
           path: trivy-report.html
 
+  # ──────────────────────────────
+  # 2) Spin test stack + run Selenium
+  # ──────────────────────────────
   test:
     runs-on: [self-hosted, linux, x64]
     needs: build-and-scan
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Ensure kernel limits for OpenSearch
+      # Kernel and Docker sanity for OpenSearch/Swarm
+      - name: Set kernel params for OpenSearch
         run: |
           sudo sysctl -w vm.max_map_count=262144
           sudo sysctl -w fs.file-max=65536
 
-      - name: Ensure Docker usable & init Swarm
+      - name: Ensure Docker is usable & init Swarm
         run: |
           docker version
           docker info
@@ -95,6 +108,7 @@ jobs:
           set -euo pipefail
           STACK=wazuh-test
           docker stack deploy -c stack/wazuh-stack.yml "$STACK"
+          echo "Waiting for services to report desired replicas…"
           for i in {1..60}; do
             READY=$(docker stack services "$STACK" --format '{{.Replicas}}' | awk -F/ '$1==$2' | wc -l)
             TOTAL=$(docker stack services "$STACK" --format '{{.Replicas}}' | wc -l)
@@ -102,32 +116,32 @@ jobs:
             [ "$READY" = "$TOTAL" ] && break || sleep 5
           done
 
-      # ----- HARD READINESS CHECKS (with auth) -----
-      - name: Wait for OpenSearch HTTP health (admin:admin)
+      # ✅ Run the OpenSearch check INSIDE the overlay network (no more hangs)
+      - name: Wait for OpenSearch health (inside Swarm network)
         run: |
           set -e
+          STACK=wazuh-test
+          NET="${STACK}_soc"
           for i in {1..120}; do
-            out=$(curl -sk -u admin:admin https://wazuh.indexer:9200/_cluster/health || true)
-            echo "$out" | jq . || echo "$out"
-            echo "$out" | grep -q '"status"' && exit 0
+            CODE=$(docker run --rm --network "$NET" curlimages/curl:8.10.1 \
+                     -sk -u admin:admin -o /dev/null -w '%{http_code}' \
+                     https://wazuh.indexer:9200/_cluster/health || true)
+            echo "OpenSearch HTTP: $CODE"
+            if [ "$CODE" = "200" ]; then
+              echo "Cluster health:"
+              docker run --rm --network "$NET" curlimages/curl:8.10.1 \
+                -sk -u admin:admin https://wazuh.indexer:9200/_cluster/health
+              exit 0
+            fi
+            docker service ls
             sleep 5
           done
-          echo "OpenSearch did not become healthy in time"; exit 1
-
-      - name: Wait for Wazuh API to answer (wazuh:wazuh)
-        run: |
-          set -e
-          for i in {1..120}; do
-            code=$(curl -sk -u wazuh:wazuh -o /dev/null -w "%{http_code}" https://localhost:55000)
-            echo "API HTTP code: $code"
-            [ "$code" != "000" ] && exit 0
-            sleep 5
-          done
-          echo "Wazuh API did not respond in time"; exit 1
+          echo "OpenSearch did not become healthy in time"
+          docker service ps ${STACK}_wazuh-indexer --no-trunc || true
+          exit 1
 
       - name: Wait for Wazuh dashboard on https://localhost:443
         run: |
-          set -e
           for i in {1..120}; do
             if curl -skf https://localhost:443 >/dev/null; then
               echo "✅ Dashboard is up"; exit 0
@@ -137,12 +151,10 @@ jobs:
             sleep 5
           done
           echo "❌ Dashboard did not become ready in time"
-          docker service ps wazuh-test_wazuh-dashboard --no-trunc || true
-          cid=$(docker ps --filter "name=wazuh-test_wazuh-dashboard.1" --format '{{.ID}}' | head -1)
-          [ -n "$cid" ] && docker logs --tail 200 "$cid" || true
+          docker service ps wazuh-test_wazuh-dashboard || true
           exit 1
-      # ---------------------------------------------
 
+      # System deps for Selenium (Chromium + chromedriver)
       - name: Install Chromium & chromedriver
         run: |
           sudo apt-get update
@@ -179,10 +191,14 @@ jobs:
           done
           docker system prune -af --volumes || true
 
+  # ──────────────────────────────
+  # 3) Deploy to Swarm with Ansible (main branch pushes only)
+  # ──────────────────────────────
   deploy:
     runs-on: [self-hosted, linux, x64]
     needs: [build-and-scan, test]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
