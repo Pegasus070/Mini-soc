@@ -13,6 +13,7 @@ env:
 jobs:
   build-and-scan:
     runs-on: [self-hosted, linux, x64]
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -75,6 +76,7 @@ jobs:
   test:
     runs-on: [self-hosted, linux, x64]
     needs: build-and-scan
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -95,34 +97,43 @@ jobs:
           set -euo pipefail
           STACK=wazuh-test
           docker stack deploy -c stack/wazuh-stack.yml "$STACK"
-          echo "Waiting for services to report desired replicas…"
-          for i in {1..60}; do
+
+          echo "Waiting for services to reach desired replicas…"
+          for i in {1..120}; do
             READY=$(docker stack services "$STACK" --format '{{.Replicas}}' | awk -F/ '$1==$2' | wc -l)
             TOTAL=$(docker stack services "$STACK" --format '{{.Replicas}}' | wc -l)
             echo "Services ready: $READY/$TOTAL"
             [ "$READY" = "$TOTAL" ] && break || sleep 5
           done
 
+      # Wait for indexer to reach >= yellow instead of plain HTTP 200
       - name: Wait for OpenSearch health (inside Swarm network)
         run: |
           set -e
           STACK=wazuh-test
           NET="${STACK}_soc"
-          for i in {1..120}; do
-            CODE=$(docker run --rm --network "$NET" curlimages/curl:8.10.1 \
-                     -sk -u admin:admin -o /dev/null -w '%{http_code}' \
-                     https://wazuh.indexer:9200/_cluster/health || true)
+
+          echo "Probing cluster health (target: >= yellow)…"
+          for i in {1..60}; do
+            OUT=$(docker run --rm --network "$NET" curlimages/curl:8.10.1 \
+                    -sk -u admin:admin -w '\n%{http_code}' \
+                    'https://wazuh.indexer:9200/_cluster/health?wait_for_status=yellow&timeout=30s' || true)
+            CODE=$(echo "$OUT" | tail -n1)
+            BODY=$(echo "$OUT" | sed '$d')
+
             echo "OpenSearch HTTP: $CODE"
             if [ "$CODE" = "200" ]; then
-              docker run --rm --network "$NET" curlimages/curl:8.10.1 \
-                -sk -u admin:admin https://wazuh.indexer:9200/_cluster/health
+              echo "$BODY"
               exit 0
             fi
+
             docker service ls
-            sleep 5
+            sleep 10
           done
+
           echo "OpenSearch did not become healthy in time"
           docker service ps ${STACK}_wazuh-indexer --no-trunc || true
+          docker service logs --raw --timestamps ${STACK}_wazuh-indexer | tail -n 200 || true
           exit 1
 
       - name: Wait for Wazuh dashboard on https://localhost:443
@@ -137,6 +148,7 @@ jobs:
           done
           echo "❌ Dashboard did not become ready in time"
           docker service ps wazuh-test_wazuh-dashboard || true
+          docker service logs --raw --timestamps wazuh-test_wazuh-dashboard | tail -n 200 || true
           exit 1
 
       - name: Install Chromium & chromedriver
@@ -179,6 +191,7 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     needs: [build-and-scan, test]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
