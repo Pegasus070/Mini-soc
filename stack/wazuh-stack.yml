@@ -8,11 +8,9 @@ networks:
 services:
   wazuh-indexer:
     image: wazuh/wazuh-indexer:4.7.0
-    networks:
-      wazuh-net:
-        aliases:
-          - wazuh.indexer        # <= required for DNS
-    healthcheck:                  # helps the dashboard wait for indexer
+    networks: [wazuh-net]
+    # simple readiness check so dashboard waits
+    healthcheck:
       test: ["CMD-SHELL", "curl -sk https://localhost:9200 >/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
@@ -22,8 +20,7 @@ services:
 
   wazuh-manager:
     image: wazuh/wazuh-manager:4.7.0
-    networks:
-      - wazuh-net
+    networks: [wazuh-net]
     deploy:
       replicas: 1
 
@@ -31,15 +28,14 @@ services:
     image: wazuh/wazuh-dashboard:4.7.0
     ports:
       - "443:5601"
-    networks:
-      - wazuh-net
+    networks: [wazuh-net]
     environment:
-      # talk to the indexer alias and ignore TLS cert validation (demo-only)
-      OPENSEARCH_HOSTS: '["https://wazuh.indexer:9200"]'
+      # Use the Swarm FQDN of the indexer service:
+      OPENSEARCH_HOSTS: '["https://wazuh-test_wazuh-indexer:9200"]'
       OPENSEARCH_USERNAME: admin
       OPENSEARCH_PASSWORD: admin
-      OPENSEARCH_SSL_VERIFICATIONMODE: "none"
-      # Optional but common with OS Dashboards:
+      OPENSEARCH_SSL_VERIFICATIONMODE: "none"   # demo only
+      # Optional but harmless:
       OPENSEARCH_REQUESTHEADERSWHITELIST: '["securitytenant","Authorization"]'
     deploy:
       replicas: 1
