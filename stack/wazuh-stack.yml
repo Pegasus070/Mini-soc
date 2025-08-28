@@ -28,7 +28,6 @@ services:
       - wazuh-indexer-data:/usr/share/opensearch/data
     networks:
       soc:
-        # 👇 Make the indexer resolvable as `wazuh.indexer`
         aliases:
           - wazuh.indexer
     deploy:
@@ -39,8 +38,8 @@ services:
 
   wazuh-manager:
     image: "wazuh/wazuh-manager:${WAZUH_VERSION:-4.7.0}"
-    # Point the manager to the indexer alias
     environment:
+      # Manager -> OpenSearch endpoint
       - OPENSEARCH_URL=https://wazuh.indexer:9200
     volumes:
       - wazuh-manager-data:/var/ossec/data
@@ -56,16 +55,26 @@ services:
 
   wazuh-dashboard:
     image: "wazuh/wazuh-dashboard:${WAZUH_VERSION:-4.7.0}"
-    # Dashboard -> indexer & manager
     environment:
+      # Dashboard -> OpenSearch
       - OPENSEARCH_URL=https://wazuh.indexer:9200
+      # 👇 default OpenSearch superuser shipped for lab use
+      - OPENSEARCH_USERNAME=admin
+      - OPENSEARCH_PASSWORD=admin
+
+      # Dashboard -> Wazuh Manager API
       - WAZUH_API_URL=https://wazuh.manager:55000
+      # 👇 default API user shipped for lab use
+      - WAZUH_API_USERNAME=wazuh
+      - WAZUH_API_PASSWORD=wazuh
+
+      # Self-signed certs in lab: skip strict verification
+      - WAZUH_API_SSL_VERIFY=false
     networks:
       soc:
         aliases:
           - wazuh.dashboard
     depends_on:
       - wazuh-manager
-    # keep 443 to match your Selenium test
     ports:
       - "443:5601/tcp"
