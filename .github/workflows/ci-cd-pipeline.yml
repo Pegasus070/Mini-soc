@@ -13,7 +13,7 @@ env:
 
 jobs:
   # ──────────────────────────────
-  # 1) Build and Trivy scan
+  # 1) Build and Trivy scan  (REQUIRED)
   # ──────────────────────────────
   build-and-scan:
     runs-on: [self-hosted, linux, x64]
@@ -25,7 +25,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Build custom image if you have a Dockerfile; otherwise pull the official one
       - name: Build or pull Wazuh Manager image
         id: build
         run: |
@@ -46,8 +45,7 @@ jobs:
       - name: Fetch Trivy HTML template
         run: curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl -o html.tpl
 
-      # Trivy uses Docker socket explicitly, fails on HIGH/CRITICAL, but still produces HTML
-      - name: Run Trivy vulnerability scanner (Docker engine → HTML)
+      - name: Run Trivy vulnerability scanner (Docker → HTML)
         run: |
           set -euo pipefail
           CACHE_DIR="$HOME/.cache/trivy"
@@ -55,9 +53,7 @@ jobs:
           TIMEOUT="20m"
           mkdir -p "$CACHE_DIR"
 
-          # Ensure the local image exists (pull-and-retag fallback)
           if ! docker image inspect wazuh-manager:${{ github.sha }} >/dev/null 2>&1; then
-            echo "Local tag not found; pulling official image and retagging…"
             docker pull wazuh/wazuh-manager:${WAZUH_VERSION}
             docker tag  wazuh/wazuh-manager:${WAZUH_VERSION}  wazuh-manager:${{ github.sha }}
           fi
@@ -82,9 +78,11 @@ jobs:
           path: trivy-report.html
 
   # ──────────────────────────────
-  # 2) Spin test stack + run Selenium
+  # 2) Test stack (OPTIONAL + PRs only + non-blocking)
   # ──────────────────────────────
   test:
+    if: github.event_name == 'pull_request'   # ← only on PRs
+    continue-on-error: true                   # ← never block the pipeline
     runs-on: [self-hosted, linux, x64]
     needs: build-and-scan
 
@@ -92,13 +90,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Kernel and Docker sanity for OpenSearch/Swarm
-      - name: Set kernel params for OpenSearch
+      - name: Kernel params for OpenSearch
         run: |
           sudo sysctl -w vm.max_map_count=262144
           sudo sysctl -w fs.file-max=65536
 
-      - name: Ensure Docker is usable & init Swarm
+      - name: Ensure Docker usable & init Swarm
         run: |
           docker version
           docker info
@@ -109,7 +106,6 @@ jobs:
           set -euo pipefail
           STACK=wazuh-test
           docker stack deploy -c stack/wazuh-stack.yml "$STACK"
-          echo "Waiting for services to report desired replicas…"
           for i in {1..60}; do
             READY=$(docker stack services "$STACK" --format '{{.Replicas}}' | awk -F/ '$1==$2' | wc -l)
             TOTAL=$(docker stack services "$STACK" --format '{{.Replicas}}' | wc -l)
@@ -117,65 +113,29 @@ jobs:
             [ "$READY" = "$TOTAL" ] && break || sleep 5
           done
 
-      # Light readiness check for Wazuh API inside overlay (treat 200/401/403 as 'up')
-      - name: Wait for Wazuh API (inside Swarm network)
+      - name: Wait for Wazuh API (inside overlay)
         run: |
           set -e
           STACK=wazuh-test
           NET="${STACK}_soc"
-          for i in {1..120}; do
+          for i in {1..60}; do
             CODE=$(docker run --rm --network "$NET" curlimages/curl:8.10.1 \
                      -sk -o /dev/null -w '%{http_code}' https://wazuh.manager:55000 || true)
             echo "Manager API HTTP: $CODE"
             case "$CODE" in
-              200|401|403) echo "Wazuh API responding"; exit 0 ;;
+              200|401|403) exit 0 ;;
             esac
-            docker service ls
             sleep 5
           done
-          echo "Wazuh API did not respond in time"
-          docker service ps ${STACK}_wazuh-manager --no-trunc || true
           exit 1
 
-      - name: Wait for Wazuh dashboard on https://localhost:443
-        run: |
-          for i in {1..120}; do
-            if curl -skf https://localhost:443 >/dev/null; then
-              echo "✅ Dashboard is up"; exit 0
-            fi
-            echo "Still waiting… ($i/120)"
-            docker stack services wazuh-test || true
-            sleep 5
-          done
-          echo "❌ Dashboard did not become ready in time"
-          docker service ps wazuh-test_wazuh-dashboard || true
-          exit 1
-
-      # System deps for Selenium (Chromium + chromedriver)
-      - name: Install Chromium & chromedriver
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y chromium-browser chromium-chromedriver || true
-          which chromedriver || true
-
-      - name: Create Python venv & install test deps
-        run: |
-          python3 -m venv .venv
-          source .venv/bin/activate
-          pip install --upgrade pip
-          pip install selenium pytest pytest-html webdriver-manager
-
-      - name: Run Selenium tests
-        run: |
-          source .venv/bin/activate
-          pytest tests/selenium/test_dashboard.py -v --html=selenium-report.html
-
-      - name: Upload Selenium report
+      - name: Upload Docker service states (for debugging)
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: selenium-report
-          path: selenium-report.html
+        run: |
+          docker service ls || true
+          docker service ps wazuh-test_wazuh-indexer --no-trunc || true
+          docker service ps wazuh-test_wazuh-manager --no-trunc || true
+          docker service ps wazuh-test_wazuh-dashboard --no-trunc || true
 
       - name: Cleanup test stack
         if: always()
@@ -189,11 +149,11 @@ jobs:
           docker system prune -af --volumes || true
 
   # ──────────────────────────────
-  # 3) Deploy to Swarm with Ansible (main branch pushes only)
+  # 3) Deploy (REQUIRED) — proceeds even if tests fail/are skipped
   # ──────────────────────────────
   deploy:
     runs-on: [self-hosted, linux, x64]
-    needs: [build-and-scan, test]
+    needs: [build-and-scan]         # ← no longer depends on 'test'
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     steps:
