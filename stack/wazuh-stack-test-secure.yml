@@ -1,0 +1,85 @@
+# stack/wazuh-stack-test-secure.yml
+# CI-friendly test stack:
+# - No host port bindings (avoids collisions with prod/other jobs)
+# - Single-node OpenSearch (Wazuh Indexer) with demo security enabled
+# - Wazuh Manager & Dashboard connect over the overlay network only
+
+version: "3.8"
+
+networks:
+  soc:
+    driver: overlay
+    attachable: true   # so curl/test containers can join during the job
+
+volumes:
+  wazuh-indexer-data:
+  wazuh-manager-data:
+
+services:
+  wazuh-indexer:
+    image: "wazuh/wazuh-indexer:${WAZUH_VERSION:-4.7.0}"
+    environment:
+      # Single-node OpenSearch
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=-Xms768m -Xmx768m
+
+      # Install demo security config (creates .opendistro_security, default admin/admin, self-signed certs)
+      - DISABLE_INSTALL_DEMO_CONFIG=false
+
+      # If the image supports it, keep admin/admin explicit (harmless if ignored)
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD:-admin}
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile:  { soft: 65536, hard: 65536 }
+    cap_add: [ "IPC_LOCK" ]
+    volumes:
+      - wazuh-indexer-data:/usr/share/opensearch/data
+    networks:
+      soc:
+        aliases: [ "wazuh.indexer" ]
+    deploy:
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 10
+
+  wazuh-manager:
+    image: "wazuh/wazuh-manager:${WAZUH_VERSION:-4.7.0}"
+    environment:
+      # Talk to Indexer over the overlay; accept self-signed certs for CI
+      - OPENSEARCH_URL=https://wazuh.indexer:9200
+      - OPENSEARCH_USERNAME=${OPENSEARCH_USERNAME:-admin}
+      - OPENSEARCH_PASSWORD=${OPENSEARCH_PASSWORD:-admin}
+      - OPENSEARCH_SSL_VERIFICATION=no
+      - API_SSL_VERIFY=no
+    volumes:
+      - wazuh-manager-data:/var/ossec/data
+    networks:
+      soc:
+        aliases: [ "wazuh.manager" ]
+    depends_on:
+      - wazuh-indexer
+    # ❌ no host ports here (internal-only)
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  wazuh-dashboard:
+    image: "wazuh/wazuh-dashboard:${WAZUH_VERSION:-4.7.0}"
+    environment:
+      - OPENSEARCH_URL=https://wazuh.indexer:9200
+      - OPENSEARCH_USERNAME=${OPENSEARCH_USERNAME:-admin}
+      - OPENSEARCH_PASSWORD=${OPENSEARCH_PASSWORD:-admin}
+      - OPENSEARCH_SSL_VERIFICATION=no
+      - WAZUH_API_URL=https://wazuh.manager:55000
+      - WAZUH_API_SSL_VERIFY=no
+    networks:
+      soc:
+        aliases: [ "wazuh.dashboard" ]
+    depends_on:
+      - wazuh-manager
+    # ❌ no host ports here (internal-only)
+    deploy:
+      restart_policy:
+        condition: on-failure
