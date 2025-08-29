@@ -5,6 +5,11 @@ on:
     branches: [ main, master ]
   pull_request:
 
+# Avoid overlapping runs of this workflow on the same branch
+concurrency:
+  group: mini-soc-ci-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   WAZUH_VERSION: "4.7.0"
 
@@ -21,6 +26,8 @@ jobs:
           # put your real build/scan here
 
   test:
+    # 👇 This makes the test job wait for build-and-scan to finish
+    needs: build-and-scan
     runs-on: self-hosted
     steps:
       - name: Checkout code
@@ -56,7 +63,7 @@ jobs:
           SLEEP=20
           for i in $(seq 1 "$ATTEMPTS"); do
             echo "[$i/$ATTEMPTS] Checking OpenSearch health..."
-            # run curl *inside the Swarm overlay network*
+            # run curl inside the Swarm overlay network
             OUT=$(sudo docker run --rm --network wazuh-test_soc curlimages/curl:8.9.1 \
                   -sk -u admin:admin https://wazuh.indexer:9200/_cluster/health || true)
             echo "$OUT"
@@ -85,7 +92,6 @@ jobs:
         run: |
           set -euo pipefail
           sudo docker stack rm wazuh-test || true
-          # wait for services to disappear to avoid leaking networks/volumes between jobs
           for i in $(seq 1 30); do
             if ! sudo docker stack services wazuh-test >/dev/null 2>&1; then
               echo "Stack removed."
@@ -94,13 +100,14 @@ jobs:
             sleep 2
           done
 
-  # keep your existing deploy job as-is; nothing here needs ports for test
   deploy:
-    needs: [ build-and-scan, test ]
+    # 👇 deploy will wait for test (which already waits for build-and-scan)
+    needs: test
     runs-on: self-hosted
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
       - name: Placeholder deploy
         run: |
           echo "Your real deployment steps go here (Ansible, etc.)"
