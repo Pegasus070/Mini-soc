@@ -1,3 +1,4 @@
+# .github/workflows/wazuh-soc.yml
 name: Wazuh SOC CI/CD Pipeline
 
 on:
@@ -81,7 +82,7 @@ jobs:
           path: trivy-report.html
 
   # ──────────────────────────────
-  # 2) Spin test stack + (bootstrap indexer) + run Selenium
+  # 2) Spin test stack + run Selenium
   # ──────────────────────────────
   test:
     runs-on: [self-hosted, linux, x64]
@@ -116,23 +117,24 @@ jobs:
             [ "$READY" = "$TOTAL" ] && break || sleep 5
           done
 
-      # Strict: wait until indexer REST returns 200 (after security bootstrap)
-      - name: Wait for OpenSearch health (inside Swarm network)
+      # Light readiness check for Wazuh API inside overlay (treat 200/401/403 as 'up')
+      - name: Wait for Wazuh API (inside Swarm network)
         run: |
           set -e
           STACK=wazuh-test
           NET="${STACK}_soc"
           for i in {1..120}; do
             CODE=$(docker run --rm --network "$NET" curlimages/curl:8.10.1 \
-                     -sk -u admin:admin -o /dev/null -w '%{http_code}' \
-                     https://wazuh.indexer:9200/_cluster/health || true)
-            echo "OpenSearch HTTP: $CODE"
-            [ "$CODE" = "200" ] && exit 0
+                     -sk -o /dev/null -w '%{http_code}' https://wazuh.manager:55000 || true)
+            echo "Manager API HTTP: $CODE"
+            case "$CODE" in
+              200|401|403) echo "Wazuh API responding"; exit 0 ;;
+            esac
             docker service ls
             sleep 5
           done
-          echo "OpenSearch did not become healthy in time"
-          docker service ps ${STACK}_wazuh-indexer --no-trunc || true
+          echo "Wazuh API did not respond in time"
+          docker service ps ${STACK}_wazuh-manager --no-trunc || true
           exit 1
 
       - name: Wait for Wazuh dashboard on https://localhost:443
@@ -164,10 +166,9 @@ jobs:
           pip install selenium pytest pytest-html webdriver-manager
 
       - name: Run Selenium tests
-        continue-on-error: true
         run: |
           source .venv/bin/activate
-          pytest tests/selenium/test_dashboard.py -v --html=selenium-report.html || true
+          pytest tests/selenium/test_dashboard.py -v --html=selenium-report.html
 
       - name: Upload Selenium report
         if: always()
