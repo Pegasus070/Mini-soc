@@ -78,19 +78,16 @@ jobs:
           path: trivy-report.html
 
   # ──────────────────────────────
-  # 2) Spin test stack and do basic health checks
-  #    NOTE: continue-on-error so deploy isn’t blocked
-  # ──────────────────────────────
+# 2) Spin test stack + run checks
+# ──────────────────────────────
   test:
     runs-on: [self-hosted, linux, x64]
     needs: build-and-scan
-    continue-on-error: true
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Kernel/Docker sanity for OpenSearch/Swarm
       - name: Set kernel params for OpenSearch
         run: |
           sudo sysctl -w vm.max_map_count=262144
@@ -106,8 +103,8 @@ jobs:
         run: |
           set -euo pipefail
           STACK=wazuh-test
-          docker stack deploy -c stack/wazuh-stack.yml "$STACK"
-          echo "Waiting for services to hit desired replicas…"
+          docker stack deploy -c stack/wazuh-stack-test.yml "$STACK"
+          echo "Waiting for services to reach desired replicas…"
           for i in {1..60}; do
             READY=$(docker stack services "$STACK" --format '{{.Replicas}}' | awk -F/ '$1==$2' | wc -l)
             TOTAL=$(docker stack services "$STACK" --format '{{.Replicas}}' | wc -l)
@@ -115,27 +112,27 @@ jobs:
             [ "$READY" = "$TOTAL" ] && break || sleep 5
           done
 
-      # Check OpenSearch from *inside* the overlay network
       - name: Wait for OpenSearch health (inside Swarm network)
         run: |
           set -e
           STACK=wazuh-test
           NET="${STACK}_soc"
-          for i in {1..120}; do
+          echo "Probing https://wazuh.indexer:9200/_cluster/health?wait_for_status=yellow"
+          for i in {1..180}; do    # ~15 min max
             CODE=$(docker run --rm --network "$NET" curlimages/curl:8.10.1 \
-                     -sk -u admin:admin -o /dev/null -w '%{http_code}' \
-                     https://wazuh.indexer:9200/_cluster/health || true)
+                    -sk -u admin:admin -o /dev/null -w '%{http_code}' \
+                    "https://wazuh.indexer:9200/_cluster/health?wait_for_status=yellow&timeout=30s" || true)
             echo "OpenSearch HTTP: $CODE"
             if [ "$CODE" = "200" ]; then
               docker run --rm --network "$NET" curlimages/curl:8.10.1 \
-                -sk -u admin:admin https://wazuh.indexer:9200/_cluster/health
+                -sk -u admin:admin "https://wazuh.indexer:9200/_cluster/health?pretty"
               exit 0
             fi
-            docker service ls
             sleep 5
           done
           echo "OpenSearch did not become healthy in time"
-          docker service ps ${STACK}_wazuh-indexer --no-trunc || true
+          docker service ls
+          docker service logs --no-task-ids "$STACK"_wazuh-indexer --since 15m || true
           exit 1
 
       - name: Wait for Wazuh dashboard on https://localhost:443
@@ -145,7 +142,6 @@ jobs:
               echo "✅ Dashboard is up"; exit 0
             fi
             echo "Still waiting… ($i/120)"
-            docker stack services wazuh-test || true
             sleep 5
           done
           echo "❌ Dashboard did not become ready in time"
@@ -157,7 +153,6 @@ jobs:
         run: |
           STACK=wazuh-test
           docker stack rm "$STACK" || true
-          # wait until removed
           for i in {1..30}; do
             docker stack ps "$STACK" >/dev/null 2>&1 || break
             sleep 2
