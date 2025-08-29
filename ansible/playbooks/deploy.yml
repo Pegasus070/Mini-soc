@@ -1,10 +1,39 @@
 ---
-- hosts: localhost
-  become: yes
+- name: Deploy Wazuh SOC to local Swarm
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    stack_name: "wazuh-soc"
+    # Prefer the Actions workspace; fall back to repo root from playbook dir.
+    base_dir: "{{ lookup('env','GITHUB_WORKSPACE') | default(playbook_dir ~ '/..', true) }}"
+    compose_file: "{{ base_dir }}/stack/wazuh-stack.yml"
+
   tasks:
-    - name: Ensure Docker Swarm exists
+    - name: Show paths Ansible will use (debug)
+      debug:
+        msg:
+          - "base_dir={{ base_dir }}"
+          - "compose_file={{ compose_file }}"
+
+    - name: Ensure Docker Swarm exists (idempotent)
+      become: true
       command: docker swarm init
-      ignore_errors: yes
+      register: swarm_init
+      failed_when: false
+      changed_when: "'Swarm initialized' in (swarm_init.stdout | default(''))"
 
     - name: Deploy/Update Wazuh stack
-      command: docker stack deploy -c stack/wazuh-stack.yml wazuh-soc
+      become: true
+      command: docker stack deploy -c "{{ compose_file }}" "{{ stack_name }}"
+      args:
+        chdir: "{{ base_dir }}"
+
+    - name: Show deployed services
+      command: docker stack services "{{ stack_name }}"
+      register: services
+      changed_when: false
+      failed_when: false
+
+    - debug:
+        var: services.stdout
