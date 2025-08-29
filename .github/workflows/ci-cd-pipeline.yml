@@ -117,8 +117,7 @@ jobs:
           set -e
           STACK=wazuh-test
           NET="${STACK}_soc"
-          echo "Probing https://wazuh.indexer:9200/_cluster/health?wait_for_status=yellow"
-          for i in {1..180}; do    # ~15 min max
+          for i in {1..180}; do
             CODE=$(docker run --rm --network "$NET" curlimages/curl:8.10.1 \
                     -sk -u admin:admin -o /dev/null -w '%{http_code}' \
                     "https://wazuh.indexer:9200/_cluster/health?wait_for_status=yellow&timeout=30s" || true)
@@ -131,21 +130,25 @@ jobs:
             sleep 5
           done
           echo "OpenSearch did not become healthy in time"
-          docker service ls
-          docker service logs --no-task-ids "$STACK"_wazuh-indexer --since 15m || true
+          docker service ls || true
+          docker service logs --no-task-ids "${STACK}_wazuh-indexer" --since 15m || true
           exit 1
 
-      - name: Wait for Wazuh dashboard on https://localhost:443
+      - name: Wait for Wazuh dashboard service (inside Swarm network)
         run: |
+          set -e
+          STACK=wazuh-test
+          NET="${STACK}_soc"
           for i in {1..120}; do
-            if curl -skf https://localhost:443 >/dev/null; then
+            if docker run --rm --network "$NET" curlimages/curl:8.10.1 \
+                -skf https://wazuh.dashboard:5601 >/dev/null; then
               echo "✅ Dashboard is up"; exit 0
             fi
             echo "Still waiting… ($i/120)"
             sleep 5
           done
           echo "❌ Dashboard did not become ready in time"
-          docker service ps wazuh-test_wazuh-dashboard || true
+          docker service ps ${STACK}_wazuh-dashboard --no-trunc || true
           exit 1
 
       - name: Cleanup test stack
@@ -158,6 +161,7 @@ jobs:
             sleep 2
           done
           docker system prune -af --volumes || true
+
 
   # ──────────────────────────────
   # 3) Deploy to Swarm with Ansible (main branch pushes only)
