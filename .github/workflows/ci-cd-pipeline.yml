@@ -22,10 +22,9 @@ jobs:
       - name: Quick static check (placeholder)
         run: |
           echo "Build & scan step placeholder"
-          # add your real build/scan here
 
   test:
-    needs: build-and-scan          # <-- guarantees test runs AFTER build
+    needs: build-and-scan
     runs-on: self-hosted
     steps:
       - name: Checkout code
@@ -50,29 +49,59 @@ jobs:
         run: |
           set -euo pipefail
           sudo docker stack deploy -c stack/wazuh-stack-test.yml wazuh-test
+          echo "--- Services ---"
+          sudo docker stack services wazuh-test || true
 
       - name: Wait for Wazuh Indexer (OpenSearch) to become healthy
         shell: bash
         timeout-minutes: 15
         run: |
           set -euo pipefail
-          ATTEMPTS=60
-          SLEEP=10
-          for i in $(seq 1 "$ATTEMPTS"); do
-            echo "[$i/$ATTEMPTS] Checking OpenSearch health..."
-            OUT=$(sudo docker run --rm --network wazuh-test_soc curlimages/curl:8.9.1 \
-                    -s http://wazuh.indexer:9200/_cluster/health || true)
-            echo "$OUT"
-            if echo "$OUT" | grep -q '"status":"green"\|"status":"yellow"'; then
-              echo "OpenSearch is healthy (yellow/green)."
-              exit 0
+          NET=wazuh-test_soc
+          SVC=wazuh-test_wazuh-indexer
+
+          attempts=90
+          sleep_secs=5
+
+          for i in $(seq 1 $attempts); do
+            echo "[$i/$attempts] Checking service and HTTP..."
+
+            # Is the swarm service up (1/1)?
+            if sudo docker service ls --format '{{.Name}} {{.Replicas}}' | grep -q "^${SVC} 1/1$"; then
+              echo "Service ${SVC} is 1/1."
+            else
+              sudo docker service ls | sed -n '1,999p'
             fi
-            sleep "$SLEEP"
+
+            # Hit the root endpoint first; accept 200 or 401
+            HTTP=$(sudo docker run --rm --network "$NET" curlimages/curl:8.9.1 \
+                      -sS -m 5 -w ' HTTP%{http_code}' http://wazuh.indexer:9200/ || true)
+            echo "Root response: ${HTTP:0:120}"
+
+            CODE="${HTTP##*HTTP}"
+            CODE="${CODE#HTTP}"
+            CODE="${CODE##* }"
+            CODE="${CODE:-000}"
+
+            if [ "$CODE" = "200" ] || [ "$CODE" = "401" ]; then
+              # Now check cluster health; accept green|yellow|red
+              STATUS=$(sudo docker run --rm --network "$NET" curlimages/curl:8.9.1 \
+                         -sS -m 5 'http://wazuh.indexer:9200/_cluster/health?h=status' | tr -d '\r')
+              echo "Cluster status: '$STATUS'"
+              case "$STATUS" in
+                green|yellow|red) echo "OpenSearch is up."; exit 0 ;;
+              esac
+            fi
+            sleep "$sleep_secs"
           done
-          echo "OpenSearch did not become healthy in time"
+
+          echo "OpenSearch did not become healthy in time. Dumping diagnostics..."
+          sudo docker service ps "$SVC" --no-trunc || true
+          sudo docker service logs -n 200 "$SVC" || true
           exit 1
 
       - name: Basic API sanity checks (optional)
+        if: success()
         shell: bash
         run: |
           set -euo pipefail
@@ -87,7 +116,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo docker stack rm wazuh-test || true
-          for i in $(seq 1 30); do
+          for i in $(seq 1 40); do
             if ! sudo docker stack services wazuh-test >/dev/null 2>&1; then
               echo "Stack removed."
               break
@@ -96,7 +125,7 @@ jobs:
           done
 
   deploy:
-    needs: test                    # <-- deploy waits for test to pass
+    needs: test
     runs-on: self-hosted
     steps:
       - name: Checkout code

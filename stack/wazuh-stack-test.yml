@@ -15,8 +15,9 @@ services:
     environment:
       - discovery.type=single-node
       - bootstrap.memory_lock=true
-      - OPENSEARCH_JAVA_OPTS=-Xms768m -Xmx768m
-      # ✅ turn off the security plugin so it doesn't block startup
+      # Small heap so it can start on tiny runners
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+      # ✅ Disable security so startup doesn't block
       - plugins.security.disabled=true
     ulimits:
       memlock: { soft: -1, hard: -1 }
