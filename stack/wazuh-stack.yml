@@ -1,10 +1,9 @@
-# stack/wazuh-stack.yml
 version: "3.8"
 
 networks:
   soc:
     driver: overlay
-    attachable: true   # allow docker run to join for network-scoped checks
+    attachable: true   # <— allows docker run to join the overlay during tests
 
 volumes:
   wazuh-indexer-data:
@@ -17,6 +16,8 @@ services:
       - discovery.type=single-node
       - bootstrap.memory_lock=true
       - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+      # NOTE: we rely on the image's default security bootstrap.
+      # If you use custom certs, add the appropriate mounts/env here.
     ulimits:
       memlock:
         soft: -1

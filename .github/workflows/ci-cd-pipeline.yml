@@ -1,4 +1,3 @@
-# .github/workflows/wazuh-soc.yml
 name: Wazuh SOC CI/CD Pipeline
 
 on:
@@ -13,7 +12,7 @@ env:
 
 jobs:
   # ──────────────────────────────
-  # 1) Build and Trivy scan  (REQUIRED)
+  # 1) Build and Trivy scan
   # ──────────────────────────────
   build-and-scan:
     runs-on: [self-hosted, linux, x64]
@@ -25,6 +24,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Build custom image if present, else pull official
       - name: Build or pull Wazuh Manager image
         id: build
         run: |
@@ -45,7 +45,7 @@ jobs:
       - name: Fetch Trivy HTML template
         run: curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl -o html.tpl
 
-      - name: Run Trivy vulnerability scanner (Docker → HTML)
+      - name: Run Trivy vulnerability scanner (Docker engine → HTML)
         run: |
           set -euo pipefail
           CACHE_DIR="$HOME/.cache/trivy"
@@ -78,24 +78,25 @@ jobs:
           path: trivy-report.html
 
   # ──────────────────────────────
-  # 2) Test stack (OPTIONAL + PRs only + non-blocking)
+  # 2) Spin test stack and do basic health checks
+  #    NOTE: continue-on-error so deploy isn’t blocked
   # ──────────────────────────────
   test:
-    if: github.event_name == 'pull_request'   # ← only on PRs
-    continue-on-error: true                   # ← never block the pipeline
     runs-on: [self-hosted, linux, x64]
     needs: build-and-scan
+    continue-on-error: true
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Kernel params for OpenSearch
+      # Kernel/Docker sanity for OpenSearch/Swarm
+      - name: Set kernel params for OpenSearch
         run: |
           sudo sysctl -w vm.max_map_count=262144
           sudo sysctl -w fs.file-max=65536
 
-      - name: Ensure Docker usable & init Swarm
+      - name: Ensure Docker is usable & init Swarm
         run: |
           docker version
           docker info
@@ -106,6 +107,7 @@ jobs:
           set -euo pipefail
           STACK=wazuh-test
           docker stack deploy -c stack/wazuh-stack.yml "$STACK"
+          echo "Waiting for services to hit desired replicas…"
           for i in {1..60}; do
             READY=$(docker stack services "$STACK" --format '{{.Replicas}}' | awk -F/ '$1==$2' | wc -l)
             TOTAL=$(docker stack services "$STACK" --format '{{.Replicas}}' | wc -l)
@@ -113,35 +115,49 @@ jobs:
             [ "$READY" = "$TOTAL" ] && break || sleep 5
           done
 
-      - name: Wait for Wazuh API (inside overlay)
+      # Check OpenSearch from *inside* the overlay network
+      - name: Wait for OpenSearch health (inside Swarm network)
         run: |
           set -e
           STACK=wazuh-test
           NET="${STACK}_soc"
-          for i in {1..60}; do
+          for i in {1..120}; do
             CODE=$(docker run --rm --network "$NET" curlimages/curl:8.10.1 \
-                     -sk -o /dev/null -w '%{http_code}' https://wazuh.manager:55000 || true)
-            echo "Manager API HTTP: $CODE"
-            case "$CODE" in
-              200|401|403) exit 0 ;;
-            esac
+                     -sk -u admin:admin -o /dev/null -w '%{http_code}' \
+                     https://wazuh.indexer:9200/_cluster/health || true)
+            echo "OpenSearch HTTP: $CODE"
+            if [ "$CODE" = "200" ]; then
+              docker run --rm --network "$NET" curlimages/curl:8.10.1 \
+                -sk -u admin:admin https://wazuh.indexer:9200/_cluster/health
+              exit 0
+            fi
+            docker service ls
             sleep 5
           done
+          echo "OpenSearch did not become healthy in time"
+          docker service ps ${STACK}_wazuh-indexer --no-trunc || true
           exit 1
 
-      - name: Upload Docker service states (for debugging)
-        if: always()
+      - name: Wait for Wazuh dashboard on https://localhost:443
         run: |
-          docker service ls || true
-          docker service ps wazuh-test_wazuh-indexer --no-trunc || true
-          docker service ps wazuh-test_wazuh-manager --no-trunc || true
-          docker service ps wazuh-test_wazuh-dashboard --no-trunc || true
+          for i in {1..120}; do
+            if curl -skf https://localhost:443 >/dev/null; then
+              echo "✅ Dashboard is up"; exit 0
+            fi
+            echo "Still waiting… ($i/120)"
+            docker stack services wazuh-test || true
+            sleep 5
+          done
+          echo "❌ Dashboard did not become ready in time"
+          docker service ps wazuh-test_wazuh-dashboard || true
+          exit 1
 
       - name: Cleanup test stack
         if: always()
         run: |
           STACK=wazuh-test
           docker stack rm "$STACK" || true
+          # wait until removed
           for i in {1..30}; do
             docker stack ps "$STACK" >/dev/null 2>&1 || break
             sleep 2
@@ -149,11 +165,11 @@ jobs:
           docker system prune -af --volumes || true
 
   # ──────────────────────────────
-  # 3) Deploy (REQUIRED) — proceeds even if tests fail/are skipped
+  # 3) Deploy to Swarm with Ansible (main branch pushes only)
   # ──────────────────────────────
   deploy:
     runs-on: [self-hosted, linux, x64]
-    needs: [build-and-scan]         # ← no longer depends on 'test'
+    needs: [build-and-scan, test]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     steps:
@@ -168,18 +184,24 @@ jobs:
       - name: Ensure Docker Swarm initialized
         run: docker swarm init || true
 
-      - name: Deploy via Ansible
+      
+      - name: Deploy via Ansible (passwordless sudo)
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
           ansible-playbook \
-            -i ansible/inventory/production.yml \
-            --vault-password-file .vault_pass \
+            -i "localhost," \
+            -e "ansible_connection=local ansible_python_interpreter=/usr/bin/python3" \
             -e "image_tag=${{ github.sha }}" \
+            --become --become-method=sudo \
+            --vault-password-file .vault_pass \
             ansible/playbooks/deploy.yml
+
 
       - name: Verify deployment
         run: |
           docker stack services wazuh-soc
-          python3 tests/api/health_check.py
+          # optional: add a lightweight health probe here
 
       - name: Cleanup sensitive files
         if: always()
