@@ -1,14 +1,13 @@
-# stack/wazuh-stack-test.yml
+# Minimal stack used ONLY during CI "test" job
 version: "3.8"
 
 networks:
   soc:
     driver: overlay
-    attachable: true   # so our curl container can join
+    attachable: true
 
 volumes:
   wazuh-indexer-data:
-  wazuh-manager-data:
 
 services:
   wazuh-indexer:
@@ -17,8 +16,8 @@ services:
       - discovery.type=single-node
       - bootstrap.memory_lock=true
       - OPENSEARCH_JAVA_OPTS=-Xms768m -Xmx768m
-      # Enable demo security so the security index initializes (admin/admin)
-      - DISABLE_INSTALL_DEMO_CONFIG=false
+      # ✅ turn off the security plugin so it doesn't block startup
+      - plugins.security.disabled=true
     ulimits:
       memlock: { soft: -1, hard: -1 }
       nofile:  { soft: 65536, hard: 65536 }
@@ -33,34 +32,3 @@ services:
         condition: on-failure
         delay: 5s
         max_attempts: 10
-
-  wazuh-manager:
-    image: "wazuh/wazuh-manager:${WAZUH_VERSION:-4.7.0}"
-    environment:
-      - OPENSEARCH_URL=https://wazuh.indexer:9200
-      - OPENSEARCH_USERNAME=admin
-      - OPENSEARCH_PASSWORD=admin
-      - OPENSEARCH_SSL_VERIFICATION=no
-    volumes:
-      - wazuh-manager-data:/var/ossec/data
-    networks:
-      soc:
-        aliases: [ "wazuh.manager" ]
-    depends_on:
-      - wazuh-indexer
-    # ❌ no host ports here (internal-only)
-
-  wazuh-dashboard:
-    image: "wazuh/wazuh-dashboard:${WAZUH_VERSION:-4.7.0}"
-    environment:
-      - OPENSEARCH_URL=https://wazuh.indexer:9200
-      - OPENSEARCH_USERNAME=admin
-      - OPENSEARCH_PASSWORD=admin
-      - OPENSEARCH_SSL_VERIFICATION=no
-      - WAZUH_API_URL=https://wazuh.manager:55000
-    networks:
-      soc:
-        aliases: [ "wazuh.dashboard" ]
-    depends_on:
-      - wazuh-manager
-    # ❌ no host ports here (internal-only)

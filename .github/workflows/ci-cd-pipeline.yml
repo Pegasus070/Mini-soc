@@ -5,7 +5,6 @@ on:
     branches: [ main, master ]
   pull_request:
 
-# Avoid overlapping runs of this workflow on the same branch
 concurrency:
   group: mini-soc-ci-${{ github.ref }}
   cancel-in-progress: false
@@ -23,11 +22,10 @@ jobs:
       - name: Quick static check (placeholder)
         run: |
           echo "Build & scan step placeholder"
-          # put your real build/scan here
+          # add your real build/scan here
 
   test:
-    # 👇 This makes the test job wait for build-and-scan to finish
-    needs: build-and-scan
+    needs: build-and-scan          # <-- guarantees test runs AFTER build
     runs-on: self-hosted
     steps:
       - name: Checkout code
@@ -45,31 +43,28 @@ jobs:
         run: |
           set -euo pipefail
           sudo docker info >/dev/null
-          # init if not already part of a swarm
           sudo docker node ls >/dev/null 2>&1 || sudo docker swarm init --advertise-addr 127.0.0.1 || true
 
-      - name: Deploy temporary test stack (no host ports, demo security)
+      - name: Deploy temporary test stack (indexer only, security disabled)
         shell: bash
         run: |
           set -euo pipefail
-          sudo docker stack deploy -c stack/wazuh-stack-test-secure.yml wazuh-test
+          sudo docker stack deploy -c stack/wazuh-stack-test.yml wazuh-test
 
       - name: Wait for Wazuh Indexer (OpenSearch) to become healthy
         shell: bash
-        timeout-minutes: 20
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           ATTEMPTS=60
-          SLEEP=20
+          SLEEP=10
           for i in $(seq 1 "$ATTEMPTS"); do
             echo "[$i/$ATTEMPTS] Checking OpenSearch health..."
-            # run curl inside the Swarm overlay network
             OUT=$(sudo docker run --rm --network wazuh-test_soc curlimages/curl:8.9.1 \
-                  -sk -u admin:admin https://wazuh.indexer:9200/_cluster/health || true)
+                    -s http://wazuh.indexer:9200/_cluster/health || true)
             echo "$OUT"
-            # consider yellow or green as healthy for CI
             if echo "$OUT" | grep -q '"status":"green"\|"status":"yellow"'; then
-              echo "OpenSearch is healthy enough (yellow/green)."
+              echo "OpenSearch is healthy (yellow/green)."
               exit 0
             fi
             sleep "$SLEEP"
@@ -82,9 +77,9 @@ jobs:
         run: |
           set -euo pipefail
           sudo docker run --rm --network wazuh-test_soc curlimages/curl:8.9.1 \
-            -sk -u admin:admin https://wazuh.indexer:9200
+            -s http://wazuh.indexer:9200
           sudo docker run --rm --network wazuh-test_soc curlimages/curl:8.9.1 \
-            -sk -u admin:admin https://wazuh.indexer:9200/_cat/indices
+            -s http://wazuh.indexer:9200/_cat/indices
 
       - name: Cleanup test stack
         if: always()
@@ -101,8 +96,7 @@ jobs:
           done
 
   deploy:
-    # 👇 deploy will wait for test (which already waits for build-and-scan)
-    needs: test
+    needs: test                    # <-- deploy waits for test to pass
     runs-on: self-hosted
     steps:
       - name: Checkout code
